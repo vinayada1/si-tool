@@ -3,10 +3,11 @@ package generator
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
-	"github.com/si-generator/internal/scanner"
-	"github.com/si-generator/pkg/model"
+	"github.com/vinayada1/si-tool/internal/scanner"
+	"github.com/vinayada1/si-tool/pkg/model"
 )
 
 // Builder constructs SecurityInsights from scanned data
@@ -19,8 +20,8 @@ func NewBuilder(verbose bool) *Builder {
 	return &Builder{verbose: verbose}
 }
 
-// BuildInsights creates a full SecurityInsights struct from local and GitHub data
-func (b *Builder) BuildInsights(local scanner.LocalData, remote scanner.GitHubData) model.SecurityInsights {
+// BuildInsights creates a full SecurityInsights struct from GitHub API data
+func (b *Builder) BuildInsights(remote scanner.GitHubData) model.SecurityInsights {
 	now := time.Now().Format("2006-01-02")
 
 	insights := model.SecurityInsights{
@@ -30,32 +31,8 @@ func (b *Builder) BuildInsights(local scanner.LocalData, remote scanner.GitHubDa
 			LastReviewed:  now,
 			URL:           b.buildSIFileURL(remote),
 		},
-		Project:    b.buildProject(local, remote),
-		Repository: b.buildRepository(local, remote),
-	}
-
-	return insights
-}
-
-// BuildFromLocalOnly creates SecurityInsights from local data only
-func (b *Builder) BuildFromLocalOnly(local scanner.LocalData, projectURL string) model.SecurityInsights {
-	now := time.Now().Format("2006-01-02")
-
-	// Build the SI file URL if we have a project URL
-	var siFileURL string
-	if projectURL != "" {
-		// Default to main branch if we don't know the actual default branch
-		siFileURL = fmt.Sprintf("%s/blob/main/security-insights.yml", projectURL)
-	}
-
-	insights := model.SecurityInsights{
-		Header: model.Header{
-			SchemaVersion: "2.0.0",
-			LastUpdated:   now,
-			LastReviewed:  now,
-			URL:           siFileURL,
-		},
-		Repository: b.buildRepositoryFromLocal(local, projectURL),
+		Project:    b.buildProject(remote),
+		Repository: b.buildRepository(remote),
 	}
 
 	return insights
@@ -68,40 +45,33 @@ func (b *Builder) buildSIFileURL(remote scanner.GitHubData) string {
 	return fmt.Sprintf("%s/blob/%s/security-insights.yml", remote.ProjectURL, remote.DefaultBranch)
 }
 
-func (b *Builder) buildProject(local scanner.LocalData, remote scanner.GitHubData) *model.Project {
+func (b *Builder) buildProject(remote scanner.GitHubData) *model.Project {
 	project := &model.Project{
 		Name:     remote.RepoName,
 		Homepage: remote.Homepage,
 	}
 
 	// Funding
-	if remote.HasFunding || local.FundingPath != "" {
-		if remote.FundingURL != "" {
-			project.Funding = remote.FundingURL
-		} else if local.FundingPath != "" {
-			project.Funding = local.FundingPath
-		}
+	if remote.HasFunding {
+		project.Funding = remote.FundingURL
 	}
 
 	// Roadmap
-	if remote.HasRoadmap || local.RoadmapPath != "" {
-		if remote.RoadmapURL != "" {
-			project.Roadmap = remote.RoadmapURL
-		} else if local.RoadmapPath != "" {
-			project.Roadmap = local.RoadmapPath
-		}
+	if remote.HasRoadmap {
+		project.Roadmap = remote.RoadmapURL
 	}
 
 	// Steward (if org)
 	if remote.IsOrg && remote.OrgURL != "" {
 		project.Steward = &model.Steward{
-			URI: remote.OrgURL,
+			URI:     remote.OrgURL,
+			Comment: fmt.Sprintf("Organization: %s", remote.Owner),
 		}
 	}
 
 	// Administrators from maintainers
-	if len(local.Maintainers) > 0 {
-		for i, m := range local.Maintainers {
+	if len(remote.Maintainers) > 0 {
+		for i, m := range remote.Maintainers {
 			person := model.Person{
 				Name:    m.Name,
 				Email:   m.Email,
@@ -115,24 +85,57 @@ func (b *Builder) buildProject(local scanner.LocalData, remote scanner.GitHubDat
 	}
 
 	// Documentation
-	project.Documentation = b.buildProjectDocumentation(local, remote)
+	project.Documentation = b.buildProjectDocumentation(remote)
+
+	// Repositories from org (cap at 10 to keep output manageable)
+	const maxRepos = 10
+	if len(remote.OrgRepos) > 0 {
+		for i, r := range remote.OrgRepos {
+			if i >= maxRepos {
+				break
+			}
+			project.Repositories = append(project.Repositories, model.RepositoryRef{
+				Name:    r.Name,
+				URL:     r.URL,
+				Comment: r.Description,
+			})
+		}
+	}
 
 	// Vulnerability reporting
-	project.VulnerabilityReporting = b.buildVulnerabilityReporting(local, remote)
+	project.VulnerabilityReporting = b.buildVulnerabilityReporting(remote)
 
 	return project
 }
 
-func (b *Builder) buildProjectDocumentation(local scanner.LocalData, remote scanner.GitHubData) *model.ProjectDocumentation {
+func (b *Builder) buildProjectDocumentation(remote scanner.GitHubData) *model.ProjectDocumentation {
 	docs := &model.ProjectDocumentation{}
 	hasContent := false
 
-	// Code of conduct
+	// Detailed guide from homepage
+	if remote.Homepage != "" {
+		docs.DetailedGuide = remote.Homepage
+		hasContent = true
+	}
+
+	// Code of conduct (main repo > sibling repo)
 	if remote.CodeOfConductURL != "" {
 		docs.CodeOfConduct = remote.CodeOfConductURL
 		hasContent = true
-	} else if local.CodeOfConductPath != "" {
-		docs.CodeOfConduct = local.CodeOfConductPath
+	} else if remote.SiblingCodeOfConductURL != "" {
+		docs.CodeOfConduct = remote.SiblingCodeOfConductURL
+		hasContent = true
+	}
+
+	// Release process (from sibling repos like community)
+	if remote.SiblingReleaseProcessURL != "" {
+		docs.ReleaseProcess = remote.SiblingReleaseProcessURL
+		hasContent = true
+	}
+
+	// Support policy
+	if remote.SupportPolicyURL != "" {
+		docs.SupportPolicy = remote.SupportPolicyURL
 		hasContent = true
 	}
 
@@ -143,9 +146,9 @@ func (b *Builder) buildProjectDocumentation(local scanner.LocalData, remote scan
 	return docs
 }
 
-func (b *Builder) buildVulnerabilityReporting(local scanner.LocalData, remote scanner.GitHubData) *model.VulnerabilityReporting {
+func (b *Builder) buildVulnerabilityReporting(remote scanner.GitHubData) *model.VulnerabilityReporting {
 	vr := &model.VulnerabilityReporting{
-		ReportsAccepted: remote.HasSecurityPolicy || local.SecurityPolicyPath != "",
+		ReportsAccepted: remote.HasSecurityPolicy,
 	}
 
 	// Bug bounty
@@ -157,16 +160,6 @@ func (b *Builder) buildVulnerabilityReporting(local scanner.LocalData, remote sc
 	// Policy URL
 	if remote.SecurityPolicyURL != "" {
 		vr.Policy = remote.SecurityPolicyURL
-	} else if local.SecurityPolicyPath != "" {
-		vr.Policy = local.SecurityPolicyPath
-	}
-
-	// Contact
-	if remote.ContactEmail != "" {
-		vr.Contact = &model.Contact{
-			Email:   remote.ContactEmail,
-			Primary: true,
-		}
 	}
 
 	// Only return if we have meaningful data
@@ -177,18 +170,23 @@ func (b *Builder) buildVulnerabilityReporting(local scanner.LocalData, remote sc
 	return vr
 }
 
-func (b *Builder) buildRepository(local scanner.LocalData, remote scanner.GitHubData) *model.Repository {
+func (b *Builder) buildRepository(remote scanner.GitHubData) *model.Repository {
 	repo := &model.Repository{
 		URL:                           remote.ProjectURL,
 		Status:                        b.determineStatus(remote),
 		AcceptsChangeRequest:          !remote.IsArchived,
-		AcceptsAutomatedChangeRequest: len(local.DependencyTools) > 0,
-		NoThirdPartyPackages:          !local.HasDependencies,
+		AcceptsAutomatedChangeRequest: false,
+		NoThirdPartyPackages:          !remote.HasDependencies,
 	}
 
-	// Core team from maintainers
-	if len(local.Maintainers) > 0 {
-		for i, m := range local.Maintainers {
+	// Core team: prefer maintainers, fall back to top contributors
+	// Cap at 5 to avoid noisy output from large CODEOWNERS files
+	const maxCoreTeam = 5
+	if len(remote.Maintainers) > 0 {
+		for i, m := range remote.Maintainers {
+			if i >= maxCoreTeam {
+				break
+			}
 			person := model.Person{
 				Name:    m.Name,
 				Email:   m.Email,
@@ -200,109 +198,39 @@ func (b *Builder) buildRepository(local scanner.LocalData, remote scanner.GitHub
 			repo.CoreTeam = append(repo.CoreTeam, person)
 		}
 	} else if len(remote.TopContributors) > 0 {
-		// Use top contributors as fallback
-		for i, c := range remote.TopContributors {
-			if i >= 5 { // Limit to top 5
+		// Use top contributors as fallback, skip bots
+		count := 0
+		for _, c := range remote.TopContributors {
+			if count >= maxCoreTeam {
 				break
+			}
+			if strings.Contains(c.Login, "[bot]") || scanner.IsBotAccount(c.Login) {
+				continue
 			}
 			person := model.Person{
 				Name:    c.Name,
 				Email:   c.Email,
-				Primary: i == 0,
+				Primary: count == 0,
 			}
 			if c.Login != "" {
 				person.Social = fmt.Sprintf("https://github.com/%s", c.Login)
 			}
 			repo.CoreTeam = append(repo.CoreTeam, person)
+			count++
 		}
 	}
 
 	// Documentation
-	repo.Documentation = b.buildRepositoryDocumentation(local, remote)
+	repo.Documentation = b.buildRepositoryDocumentation(remote)
 
 	// License
-	repo.License = b.buildLicense(local, remote)
+	repo.License = b.buildLicense(remote)
 
 	// Release
-	repo.Release = b.buildRelease(local, remote)
+	repo.Release = b.buildRelease(remote)
 
 	// Security
-	repo.Security = b.buildSecurity(local, remote)
-
-	return repo
-}
-
-func (b *Builder) buildRepositoryFromLocal(local scanner.LocalData, projectURL string) *model.Repository {
-	repo := &model.Repository{
-		URL:                           projectURL,
-		Status:                        "active",
-		AcceptsChangeRequest:          true,
-		AcceptsAutomatedChangeRequest: len(local.DependencyTools) > 0,
-		NoThirdPartyPackages:          !local.HasDependencies,
-	}
-
-	// Core team from maintainers
-	if len(local.Maintainers) > 0 {
-		for i, m := range local.Maintainers {
-			person := model.Person{
-				Name:    m.Name,
-				Email:   m.Email,
-				Primary: i == 0,
-			}
-			if m.GitHub != "" {
-				person.Social = fmt.Sprintf("https://github.com/%s", m.GitHub)
-			}
-			repo.CoreTeam = append(repo.CoreTeam, person)
-		}
-	}
-
-	// Documentation
-	repo.Documentation = &model.RepositoryDocumentation{
-		ContributingGuide: local.ContributingPath,
-		SecurityPolicy:    local.SecurityPolicyPath,
-		Governance:        local.GovernancePath,
-	}
-
-	// License
-	if local.LicenseType != "" {
-		repo.License = &model.License{
-			URL:        local.LicensePath,
-			Expression: local.LicenseType,
-		}
-	}
-
-	// Release
-	if local.ChangelogPath != "" || local.HasReleaseWorkflow {
-		repo.Release = &model.Release{
-			Changelog:         local.ChangelogPath,
-			AutomatedPipeline: local.HasReleaseWorkflow,
-		}
-	}
-
-	// Security
-	repo.Security = b.buildSecurityFromLocal(local)
-
-	// Distribution points and attestations
-	if repo.Release == nil && (len(local.DistributionPoints) > 0 || len(local.Attestations) > 0) {
-		repo.Release = &model.Release{}
-	}
-	if repo.Release != nil {
-		for _, dp := range local.DistributionPoints {
-			repo.Release.DistributionPoints = append(repo.Release.DistributionPoints, model.DistributionPoint{
-				URI:     dp.URL,
-				Comment: fmt.Sprintf("%s package", dp.Type),
-			})
-		}
-		// Attestations
-		for _, att := range local.Attestations {
-			repo.Release.Attestations = append(repo.Release.Attestations, model.Attestation{
-				Name:         att.Name,
-				PredicateURI: att.PredicateURI,
-				Location:     att.Location,
-				Comment:      att.Comment,
-			})
-		}
-	}
+	repo.Security = b.buildSecurity(remote)
 
 	return repo
 }
@@ -314,7 +242,7 @@ func (b *Builder) determineStatus(remote scanner.GitHubData) string {
 	return "active"
 }
 
-func (b *Builder) buildRepositoryDocumentation(local scanner.LocalData, remote scanner.GitHubData) *model.RepositoryDocumentation {
+func (b *Builder) buildRepositoryDocumentation(remote scanner.GitHubData) *model.RepositoryDocumentation {
 	docs := &model.RepositoryDocumentation{}
 	hasContent := false
 
@@ -322,26 +250,20 @@ func (b *Builder) buildRepositoryDocumentation(local scanner.LocalData, remote s
 	if remote.ContributingURL != "" {
 		docs.ContributingGuide = remote.ContributingURL
 		hasContent = true
-	} else if local.ContributingPath != "" {
-		docs.ContributingGuide = local.ContributingPath
-		hasContent = true
 	}
 
 	// Security policy
 	if remote.SecurityPolicyURL != "" {
 		docs.SecurityPolicy = remote.SecurityPolicyURL
 		hasContent = true
-	} else if local.SecurityPolicyPath != "" {
-		docs.SecurityPolicy = local.SecurityPolicyPath
-		hasContent = true
 	}
 
-	// Governance
+	// Governance (main repo > sibling repo)
 	if remote.GovernanceURL != "" {
 		docs.Governance = remote.GovernanceURL
 		hasContent = true
-	} else if local.GovernancePath != "" {
-		docs.Governance = local.GovernancePath
+	} else if remote.SiblingGovernanceURL != "" {
+		docs.Governance = remote.SiblingGovernanceURL
 		hasContent = true
 	}
 
@@ -349,17 +271,11 @@ func (b *Builder) buildRepositoryDocumentation(local scanner.LocalData, remote s
 	if remote.ReviewPolicyURL != "" {
 		docs.ReviewPolicy = remote.ReviewPolicyURL
 		hasContent = true
-	} else if local.ReviewPolicyPath != "" {
-		docs.ReviewPolicy = local.ReviewPolicyPath
-		hasContent = true
 	}
 
 	// Dependency management policy
 	if remote.DependencyManagementPolicyURL != "" {
 		docs.DependencyManagementPolicy = remote.DependencyManagementPolicyURL
-		hasContent = true
-	} else if local.DependencyManagementPolicyPath != "" {
-		docs.DependencyManagementPolicy = local.DependencyManagementPolicyPath
 		hasContent = true
 	}
 
@@ -370,25 +286,18 @@ func (b *Builder) buildRepositoryDocumentation(local scanner.LocalData, remote s
 	return docs
 }
 
-func (b *Builder) buildLicense(local scanner.LocalData, remote scanner.GitHubData) *model.License {
-	if remote.License == "" && local.LicenseType == "" {
+func (b *Builder) buildLicense(remote scanner.GitHubData) *model.License {
+	if remote.License == "" {
 		return nil
 	}
 
-	license := &model.License{}
-
-	if remote.License != "" {
-		license.Expression = remote.License
-		license.URL = remote.LicenseURL
-	} else {
-		license.Expression = local.LicenseType
-		license.URL = local.LicensePath
+	return &model.License{
+		Expression: remote.License,
+		URL:        remote.LicenseURL,
 	}
-
-	return license
 }
 
-func (b *Builder) buildRelease(local scanner.LocalData, remote scanner.GitHubData) *model.Release {
+func (b *Builder) buildRelease(remote scanner.GitHubData) *model.Release {
 	release := &model.Release{}
 	hasContent := false
 
@@ -396,19 +305,16 @@ func (b *Builder) buildRelease(local scanner.LocalData, remote scanner.GitHubDat
 	if remote.ChangelogURL != "" {
 		release.Changelog = remote.ChangelogURL
 		hasContent = true
-	} else if local.ChangelogPath != "" {
-		release.Changelog = local.ChangelogPath
-		hasContent = true
 	}
 
 	// Automated pipeline
-	if remote.HasAutomatedReleases || local.HasReleaseWorkflow {
+	if remote.HasAutomatedReleases {
 		release.AutomatedPipeline = true
 		hasContent = true
 	}
 
-	// Attestations (SLSA, SBOM, Sigstore, etc.)
-	for _, att := range local.Attestations {
+	// Attestations
+	for _, att := range remote.Attestations {
 		release.Attestations = append(release.Attestations, model.Attestation{
 			Name:         att.Name,
 			PredicateURI: att.PredicateURI,
@@ -418,10 +324,14 @@ func (b *Builder) buildRelease(local scanner.LocalData, remote scanner.GitHubDat
 		hasContent = true
 	}
 
-	// Note: When scanning a remote repo via API, we skip local.DistributionPoints
-	// because they would be from the wrong (local) repository.
-	// Distribution points detection for remote repos would require API access
-	// to their package.json, go.mod, etc.
+	// Distribution points from package manifests
+	for _, dp := range remote.DistributionPoints {
+		release.DistributionPoints = append(release.DistributionPoints, model.DistributionPoint{
+			URI:     dp.URL,
+			Comment: fmt.Sprintf("%s package", dp.Type),
+		})
+		hasContent = true
+	}
 
 	// GitHub releases as distribution point
 	if remote.HasReleases {
@@ -439,144 +349,106 @@ func (b *Builder) buildRelease(local scanner.LocalData, remote scanner.GitHubDat
 	return release
 }
 
-func (b *Builder) buildSecurity(local scanner.LocalData, remote scanner.GitHubData) *model.Security {
+func (b *Builder) buildSecurity(remote scanner.GitHubData) *model.Security {
 	security := &model.Security{}
 	hasContent := false
 
-	// Security practices from GitHub API
-	if remote.MFAEnforced || remote.BranchProtectionEnabled || remote.CodeReviewRequired {
-		security.Practices = &model.SecurityPractices{
-			MFAEnforced:        remote.MFAEnforced,
-			BranchProtection:   remote.BranchProtectionEnabled,
-			CodeReviewRequired: remote.CodeReviewRequired,
+	// Assessments: prefer remote, fall back to sibling repo
+	selfAssessment := remote.SelfAssessment
+	if selfAssessment == nil && remote.SiblingThreatModelURL != "" {
+		comment := "Threat model documentation"
+		if len(remote.SiblingThreatModelFiles) > 0 {
+			comment = strings.Join(remote.SiblingThreatModelFiles, "\n")
 		}
-		hasContent = true
+		selfAssessment = &scanner.AssessmentInfo{
+			Evidence: remote.SiblingThreatModelURL,
+			Comment:  comment,
+		}
 	}
+	thirdPartyAudits := remote.ThirdPartyAudits
 
-	// Assessments from local scan (these are from the cloned/local repo)
-	if local.SelfAssessment != nil || len(local.ThirdPartyAudits) > 0 {
+	// Always populate assessments section if we have self-assessment
+	if selfAssessment != nil {
 		security.Assessments = &model.Assessments{}
-
-		if local.SelfAssessment != nil {
-			security.Assessments.Self = &model.Assessment{
-				Evidence: local.SelfAssessment.Evidence,
-				Date:     local.SelfAssessment.Date,
-				Comment:  local.SelfAssessment.Comment,
-			}
+		comment := selfAssessment.Comment
+		if comment == "" {
+			comment = "Self assessment has not yet been completed."
+		}
+		security.Assessments.Self = &model.Assessment{
+			Evidence: selfAssessment.Evidence,
+			Date:     selfAssessment.Date,
+			Comment:  comment,
 		}
 
-		for _, audit := range local.ThirdPartyAudits {
+		if len(thirdPartyAudits) > 0 {
+			for _, audit := range thirdPartyAudits {
+				security.Assessments.ThirdParty = append(security.Assessments.ThirdParty, model.Assessment{
+					Evidence: audit.Evidence,
+					Date:     audit.Date,
+					Comment:  audit.Comment,
+				})
+			}
+		} else {
+			// Default entry when no third-party assessments found
 			security.Assessments.ThirdParty = append(security.Assessments.ThirdParty, model.Assessment{
-				Evidence: audit.Evidence,
-				Date:     audit.Date,
-				Comment:  audit.Comment,
+				Comment: "No third-party assessment performed",
 			})
 		}
 		hasContent = true
-	}
-
-	// Security tools from local scan
-	for _, tool := range local.CodeScanningTools {
-		secTool := model.SecurityTool{
-			Name:     tool.Name,
-			Type:     tool.Type,
-			Version:  tool.Version,
-			Rulesets: tool.Rulesets,
-			Comment:  tool.Comment,
-		}
-		if tool.InAdHoc || tool.InCI || tool.InRelease {
-			secTool.Integration = &model.ToolIntegration{
-				AdHoc:   tool.InAdHoc,
-				CI:      tool.InCI,
-				Release: tool.InRelease,
-			}
-		}
-		security.Tools = append(security.Tools, secTool)
-		hasContent = true
-	}
-
-	// Security champions from local scan
-	for i, champion := range local.SecurityChampions {
-		person := model.Person{
-			Name:    champion.Name,
-			Email:   champion.Email,
-			Primary: i == 0,
-		}
-		if champion.GitHub != "" {
-			person.Social = fmt.Sprintf("https://github.com/%s", champion.GitHub)
-		}
-		security.Champions = append(security.Champions, person)
-		hasContent = true
-	}
-
-	if !hasContent {
-		return nil
-	}
-
-	return security
-}
-
-func (b *Builder) buildSecurityFromLocal(local scanner.LocalData) *model.Security {
-	security := &model.Security{}
-	hasContent := false
-
-	// Assessments
-	if local.SelfAssessment != nil || len(local.ThirdPartyAudits) > 0 {
-		security.Assessments = &model.Assessments{}
-
-		if local.SelfAssessment != nil {
-			security.Assessments.Self = &model.Assessment{
-				Evidence: local.SelfAssessment.Evidence,
-				Date:     local.SelfAssessment.Date,
-				Comment:  local.SelfAssessment.Comment,
-			}
-		}
-
-		for _, audit := range local.ThirdPartyAudits {
-			security.Assessments.ThirdParty = append(security.Assessments.ThirdParty, model.Assessment{
-				Evidence: audit.Evidence,
-				Date:     audit.Date,
-				Comment:  audit.Comment,
-			})
-		}
-		hasContent = true
-	} else if local.AuditHistory != "" {
-		// Fallback to old simple detection
+	} else if len(thirdPartyAudits) > 0 {
 		security.Assessments = &model.Assessments{
 			Self: &model.Assessment{
-				Evidence: local.AuditHistory,
+				Comment: "Self assessment has not yet been completed.",
+			},
+		}
+		for _, audit := range thirdPartyAudits {
+			security.Assessments.ThirdParty = append(security.Assessments.ThirdParty, model.Assessment{
+				Evidence: audit.Evidence,
+				Date:     audit.Date,
+				Comment:  audit.Comment,
+			})
+		}
+		hasContent = true
+	} else {
+		// Always provide assessments section with default self-assessment
+		security.Assessments = &model.Assessments{
+			Self: &model.Assessment{
+				Comment: "Self assessment has not yet been completed.",
 			},
 		}
 		hasContent = true
 	}
 
 	// Security tools
-	for _, tool := range local.CodeScanningTools {
+	for _, tool := range remote.CodeScanningTools {
 		secTool := model.SecurityTool{
-			Name:     tool.Name,
-			Type:     tool.Type,
-			Version:  tool.Version,
-			Rulesets: tool.Rulesets,
-			Comment:  tool.Comment,
-		}
-
-		if tool.InAdHoc || tool.InCI || tool.InRelease {
-			secTool.Integration = &model.ToolIntegration{
+			Name:    tool.Name,
+			Type:    tool.Type,
+			Version: tool.Version,
+			Comment: tool.Comment,
+			Results: &model.ToolResults{},
+			Integration: &model.ToolIntegration{
 				AdHoc:   tool.InAdHoc,
 				CI:      tool.InCI,
 				Release: tool.InRelease,
-			}
+			},
 		}
-
+		if len(tool.Rulesets) > 0 {
+			secTool.Rulesets = tool.Rulesets
+		} else {
+			secTool.Rulesets = []string{"default"}
+		}
 		security.Tools = append(security.Tools, secTool)
 		hasContent = true
 	}
 
 	// Dependency tools
-	for _, tool := range local.DependencyTools {
+	for _, tool := range remote.DependencyTools {
 		security.Tools = append(security.Tools, model.SecurityTool{
-			Name: tool,
-			Type: "SCA",
+			Name:     tool,
+			Type:     "SCA",
+			Rulesets: []string{"default"},
+			Results:  &model.ToolResults{},
 			Integration: &model.ToolIntegration{
 				CI: true,
 			},
@@ -584,17 +456,8 @@ func (b *Builder) buildSecurityFromLocal(local scanner.LocalData) *model.Securit
 		hasContent = true
 	}
 
-	// Fuzzing
-	if local.FuzzingEnabled {
-		security.Tools = append(security.Tools, model.SecurityTool{
-			Name: "Fuzzing",
-			Type: "Fuzzing",
-		})
-		hasContent = true
-	}
-
 	// Security champions
-	for i, champion := range local.SecurityChampions {
+	for i, champion := range remote.SecurityChampions {
 		person := model.Person{
 			Name:    champion.Name,
 			Email:   champion.Email,

@@ -1,4 +1,4 @@
-module github.com/si-generator
+module github.com/vinayada1/si-tool
 
 go 1.24.0
 

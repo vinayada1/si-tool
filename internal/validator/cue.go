@@ -3,14 +3,23 @@ package validator
 
 import (
 	"fmt"
+	"io"
+	"net/http"
 	"os"
-	"os/exec"
-	"strings"
+	"sync"
 
 	"cuelang.org/go/cue"
 	"cuelang.org/go/cue/cuecontext"
 	"cuelang.org/go/cue/errors"
 	cueyaml "cuelang.org/go/encoding/yaml"
+)
+
+const defaultSchemaURL = "https://raw.githubusercontent.com/ossf/security-insights/main/spec/schema.cue"
+
+var (
+	cachedSchema   string
+	schemaOnce     sync.Once
+	schemaFetchErr error
 )
 
 // CUEValidator validates security-insights.yml against a CUE schema
@@ -34,32 +43,31 @@ func NewCUEValidator(schemaPath string, verbose bool) *CUEValidator {
 	}
 }
 
-// DefaultSchema returns the embedded default CUE schema for security-insights
-func DefaultSchema() string {
-	return `
-// Security Insights Schema v2.0.0
-// Based on OSSF Security Insights Specification
+// FetchDefaultSchema fetches the official OSSF CUE schema from GitHub.
+// The result is cached after the first successful fetch.
+func FetchDefaultSchema() (string, error) {
+	schemaOnce.Do(func() {
+		resp, err := http.Get(defaultSchemaURL)
+		if err != nil {
+			schemaFetchErr = fmt.Errorf("failed to fetch schema from %s: %w", defaultSchemaURL, err)
+			return
+		}
+		defer resp.Body.Close()
 
-#SecurityInsights: {
-	"schema-version": string & =~"^[0-9]+\\.[0-9]+\\.[0-9]+$"
-	"project-url": string & =~"^https?://"
-	contact?: string
-	"security-policy"?: string
-	"bug-bounty"?: string
-	"vulnerability-disclosure"?: string
-	"code-of-conduct"?: string
-	"mfa-enforced": bool
-	"branch-protection": bool
-	"code-review": bool
-	"code-scanning"?: [...string]
-	"dependency-updates"?: [...string]
-	fuzzing?: bool
-	"audit-history"?: string
-	"third-party-dependencies": bool
-	license?: string
-	"last-reviewed": string & =~"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"
-}
-`
+		if resp.StatusCode != http.StatusOK {
+			schemaFetchErr = fmt.Errorf("failed to fetch schema from %s: HTTP %d", defaultSchemaURL, resp.StatusCode)
+			return
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			schemaFetchErr = fmt.Errorf("failed to read schema response: %w", err)
+			return
+		}
+
+		cachedSchema = string(body)
+	})
+	return cachedSchema, schemaFetchErr
 }
 
 // Validate validates YAML content against the CUE schema
@@ -80,7 +88,11 @@ func (v *CUEValidator) Validate(yamlContent []byte) (*ValidationResult, error) {
 		}
 		schemaValue = ctx.CompileBytes(schemaContent)
 	} else {
-		schemaValue = ctx.CompileString(DefaultSchema())
+		schema, err := FetchDefaultSchema()
+		if err != nil {
+			return nil, err
+		}
+		schemaValue = ctx.CompileString(schema)
 	}
 
 	if schemaValue.Err() != nil {
@@ -107,7 +119,7 @@ func (v *CUEValidator) Validate(yamlContent []byte) (*ValidationResult, error) {
 	}
 
 	unified := def.Unify(dataValue)
-	if err := unified.Validate(); err != nil {
+	if err := unified.Validate(cue.Concrete(true)); err != nil {
 		result.Valid = false
 		for _, e := range errors.Errors(err) {
 			result.Errors = append(result.Errors, e.Error())
@@ -130,11 +142,11 @@ func (v *CUEValidator) ValidateFile(filePath string) (*ValidationResult, error) 
 
 func (v *CUEValidator) checkWarnings(value cue.Value, result *ValidationResult) {
 	recommendedFields := []string{
-		"security-policy",
-		"vulnerability-disclosure",
-		"code-of-conduct",
-		"code-scanning",
-		"dependency-updates",
+		"project.documentation",
+		"project.vulnerability-reporting.policy",
+		"repository.documentation.security-policy",
+		"repository.documentation.contributing-guide",
+		"repository.release",
 	}
 
 	for _, field := range recommendedFields {
@@ -144,36 +156,6 @@ func (v *CUEValidator) checkWarnings(value cue.Value, result *ValidationResult) 
 				fmt.Sprintf("recommended field '%s' is not set", field))
 		}
 	}
-}
-
-// ValidateWithCLI validates using the cue CLI tool (fallback method)
-func ValidateWithCLI(yamlPath, schemaPath string) (*ValidationResult, error) {
-	result := &ValidationResult{
-		Valid:    true,
-		Errors:   []string{},
-		Warnings: []string{},
-	}
-
-	_, err := exec.LookPath("cue")
-	if err != nil {
-		return nil, fmt.Errorf("cue CLI not found: %w", err)
-	}
-
-	var cmd *exec.Cmd
-	if schemaPath != "" {
-		cmd = exec.Command("cue", "vet", yamlPath, schemaPath)
-	} else {
-		cmd = exec.Command("cue", "vet", yamlPath)
-	}
-
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		result.Valid = false
-		lines := strings.Split(strings.TrimSpace(string(output)), "\n")
-		result.Errors = append(result.Errors, lines...)
-	}
-
-	return result, nil
 }
 
 // PrintResult prints the validation result to stdout

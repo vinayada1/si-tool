@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
-	"github.com/si-generator/internal/generator"
-	"github.com/si-generator/internal/scanner"
-	"github.com/si-generator/internal/validator"
-	"github.com/si-generator/pkg/model"
 	"github.com/spf13/cobra"
+	"github.com/vinayada1/si-tool/internal/generator"
+	"github.com/vinayada1/si-tool/internal/scanner"
+	"github.com/vinayada1/si-tool/internal/validator"
+	"github.com/vinayada1/si-tool/internal/wizard"
+	"github.com/vinayada1/si-tool/pkg/model"
 )
 
 var (
@@ -23,35 +25,21 @@ var (
 
 // CLI flags
 var (
-	outputPath  string
-	dryRun      bool
-	interactive bool
-	token       string
-	repoURL     string
-	force       bool
-	verbose     bool
-	inputPath   string
-	schemaPath  string
-	comment     string
-	showEmpty   bool
+	outputPath string
+	dryRun     bool
+	token      string
+	repoURL    string
+	force      bool
+	verbose    bool
+	inputPath  string
+	schemaPath string
 
-	// Security practice override flags
-	mfaEnforced      *bool
-	branchProtection *bool
-	codeReview       *bool
+	// Assessment override flags (format: URL or URL,YYYY-MM-DD)
+	selfAssessment  string
+	thirdPartyAudit string
 
-	// Assessment override flags
-	selfAssessmentURL   string
-	selfAssessmentDate  string
-	thirdPartyAuditURL  string
-	thirdPartyAuditDate string
-
-	// Champion flags
-	championName  string
-	championEmail string
-
-	// Tool flags
-	toolResultsURL string
+	// Wizard flags
+	wizardPort int
 )
 
 func main() {
@@ -59,7 +47,7 @@ func main() {
 		Use:   "si-gen",
 		Short: "Generate security-insights.yml for GitHub repositories",
 		Long: `si-gen is a CLI tool that generates security-insights.yml files 
-for GitHub repositories by scanning local files and GitHub API.
+for GitHub repositories by querying the GitHub API.
 
 It automatically detects security policies, code scanning tools,
 vulnerability reporting, release information, and other security-related configurations.
@@ -71,48 +59,32 @@ The output follows the Security Insights Spec 2.0.0 format.`,
 	generateCmd := &cobra.Command{
 		Use:   "generate",
 		Short: "Generate a security-insights.yml file",
-		Long: `Generate a security-insights.yml file by scanning the local repository
-and optionally fetching data from the GitHub API.
+		Long: `Generate a security-insights.yml file by fetching data from the GitHub API.
+
+A GitHub token is required (via --token flag or GITHUB_TOKEN env var).
+The repository URL can be specified with --repo-url or auto-detected from
+the current directory's git remote.
 
 The generated file follows the Security Insights Spec 2.0.0 format with
 header, project, and repository sections.
 
 Examples:
-  si-gen generate
-  si-gen generate --output .github/security-insights.yml
-  si-gen generate --repo-url https://github.com/org/repo
-  si-gen generate --token $GITHUB_TOKEN
-  si-gen generate --dry-run`,
+  si-gen generate --token $GITHUB_TOKEN --repo-url https://github.com/org/repo
+  si-gen generate --token $GITHUB_TOKEN --repo-url https://github.com/org/repo --dry-run
+  si-gen generate --token $GITHUB_TOKEN --output .github/security-insights.yml`,
 		RunE: runGenerate,
 	}
 
 	generateCmd.Flags().StringVarP(&outputPath, "output", "o", "./security-insights.yml", "Output file path")
 	generateCmd.Flags().BoolVar(&dryRun, "dry-run", false, "Print output to stdout instead of writing to file")
-	generateCmd.Flags().BoolVarP(&interactive, "interactive", "i", false, "Prompt for missing fields interactively")
 	generateCmd.Flags().StringVarP(&token, "token", "t", "", "GitHub token (or use GITHUB_TOKEN env var)")
 	generateCmd.Flags().StringVarP(&repoURL, "repo-url", "r", "", "Repository URL (auto-detected from git remote if not specified)")
 	generateCmd.Flags().BoolVarP(&force, "force", "f", false, "Overwrite existing file")
 	generateCmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Enable verbose output")
 
-	// Security practice overrides (useful when API cannot detect or for manual specification)
-	mfaEnforced = generateCmd.Flags().Bool("mfa-enforced", false, "Set MFA enforcement to true")
-	branchProtection = generateCmd.Flags().Bool("branch-protection", false, "Set branch protection to true")
-	codeReview = generateCmd.Flags().Bool("code-review", false, "Set code review requirement to true")
-	generateCmd.Flags().StringVar(&comment, "comment", "", "Add a comment to the header section")
-	generateCmd.Flags().BoolVar(&showEmpty, "show-empty", false, "Show all fields including empty ones")
-
-	// Assessment overrides
-	generateCmd.Flags().StringVar(&selfAssessmentURL, "self-assessment", "", "URL to self-assessment document")
-	generateCmd.Flags().StringVar(&selfAssessmentDate, "self-assessment-date", "", "Date of self-assessment (YYYY-MM-DD)")
-	generateCmd.Flags().StringVar(&thirdPartyAuditURL, "third-party-audit", "", "URL to third-party audit report")
-	generateCmd.Flags().StringVar(&thirdPartyAuditDate, "third-party-audit-date", "", "Date of third-party audit (YYYY-MM-DD)")
-
-	// Champion overrides
-	generateCmd.Flags().StringVar(&championName, "champion", "", "Name of security champion")
-	generateCmd.Flags().StringVar(&championEmail, "champion-email", "", "Email of security champion")
-
-	// Tool overrides
-	generateCmd.Flags().StringVar(&toolResultsURL, "tool-results-url", "", "Base URL for tool results (e.g., https://example.com/release/{version})")
+	// Assessment overrides (format: URL or URL,YYYY-MM-DD)
+	generateCmd.Flags().StringVar(&selfAssessment, "self-assessment", "", "Self-assessment URL or URL,YYYY-MM-DD")
+	generateCmd.Flags().StringVar(&thirdPartyAudit, "third-party-audit", "", "Third-party audit URL or URL,YYYY-MM-DD")
 
 	// Validate command
 	validateCmd := &cobra.Command{
@@ -141,8 +113,31 @@ Examples:
 		},
 	}
 
+	// Wizard command
+	wizardCmd := &cobra.Command{
+		Use:   "wizard",
+		Short: "Launch a web-based wizard to generate security-insights.yml",
+		Long: `Launch an interactive web-based wizard that scans a GitHub repository,
+pre-populates all fields, and lets you review and edit before generating.
+
+A GitHub token is required (via --token flag or GITHUB_TOKEN env var).
+
+Examples:
+  si-gen wizard --token $GITHUB_TOKEN
+  si-gen wizard --token $GITHUB_TOKEN --repo-url https://github.com/org/repo
+  si-gen wizard --token $GITHUB_TOKEN --port 9090`,
+		RunE: runWizard,
+	}
+
+	wizardCmd.Flags().StringVarP(&token, "token", "t", "", "GitHub token (or use GITHUB_TOKEN env var)")
+	wizardCmd.Flags().StringVarP(&repoURL, "repo-url", "r", "", "Repository URL (can also be entered in the UI)")
+	wizardCmd.Flags().StringVarP(&outputPath, "output", "o", "./security-insights.yml", "Output file path")
+	wizardCmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Enable verbose output")
+	wizardCmd.Flags().IntVar(&wizardPort, "port", 8899, "Port for the wizard web server")
+
 	rootCmd.AddCommand(generateCmd)
 	rootCmd.AddCommand(validateCmd)
+	rootCmd.AddCommand(wizardCmd)
 	rootCmd.AddCommand(versionCmd)
 
 	if err := rootCmd.Execute(); err != nil {
@@ -153,102 +148,56 @@ Examples:
 func runGenerate(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
 
-	// Get current working directory as repo root
-	repoPath, err := os.Getwd()
-	if err != nil {
-		return fmt.Errorf("failed to get current directory: %w", err)
-	}
-
-	if verbose {
-		fmt.Printf("🔍 Scanning repository at %s\n", repoPath)
-	}
-
-	// Scan local repository
-	localScanner := scanner.NewLocalScanner(repoPath, verbose)
-	localData, err := localScanner.Scan()
-	if err != nil {
-		return fmt.Errorf("failed to scan local repository: %w", err)
-	}
-
-	if verbose {
-		fmt.Println("✅ Local scan complete")
-	}
-
-	// Try to get GitHub data if token is available
+	// Resolve GitHub token
 	githubToken := token
 	if githubToken == "" {
 		githubToken = os.Getenv("GITHUB_TOKEN")
 	}
+	if githubToken == "" {
+		return fmt.Errorf("a GitHub token is required: use --token flag or set GITHUB_TOKEN environment variable")
+	}
 
-	var githubData scanner.GitHubData
-	var hasGitHubData bool
+	// Resolve repo URL: use flag or detect from git remote
+	targetURL := repoURL
+	if targetURL == "" {
+		if gs, err := scanner.NewGitHubScanner(githubToken, "", verbose); err == nil {
+			targetURL = gs.GetRepoURL()
+		}
+		if targetURL == "" {
+			return fmt.Errorf("could not determine repository URL: use --repo-url flag or run from a git repository")
+		}
+	}
 
-	if githubToken != "" || repoURL != "" {
-		if verbose {
-			fmt.Println("🔌 Fetching data from GitHub API...")
-		}
+	if verbose {
+		fmt.Printf("🔍 Scanning %s via GitHub API...\n", targetURL)
+	}
 
-		githubScanner, err := scanner.NewGitHubScanner(githubToken, repoURL, verbose)
-		if err != nil {
-			if verbose {
-				fmt.Printf("⚠️  Could not initialize GitHub scanner: %v\n", err)
-			}
-		} else {
-			githubData, err = githubScanner.Scan(ctx)
-			if err != nil {
-				if verbose {
-					fmt.Printf("⚠️  GitHub API error: %v\n", err)
-				}
-				// Still set project URL from scanner even if API failed
-				githubData.ProjectURL = githubScanner.GetRepoURL()
-			} else {
-				if verbose {
-					fmt.Println("✅ GitHub data fetched")
-				}
-				hasGitHubData = true
-			}
-		}
-	} else if repoURL == "" {
-		// Try to detect from git remote
-		if githubScanner, err := scanner.ScanWithoutAuth("", verbose); err == nil {
-			githubData.ProjectURL = githubScanner.GetRepoURL()
-		}
+	githubScanner, err := scanner.NewGitHubScanner(githubToken, targetURL, verbose)
+	if err != nil {
+		return fmt.Errorf("failed to initialize GitHub scanner: %w", err)
+	}
+
+	githubData, err := githubScanner.Scan(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to scan repository: %w", err)
+	}
+
+	if verbose {
+		fmt.Println("✅ GitHub data fetched")
 	}
 
 	// Build insights
 	builder := generator.NewBuilder(verbose)
-
-	var insights model.SecurityInsights
-	if hasGitHubData {
-		insights = builder.BuildInsights(localData, githubData)
-	} else {
-		insights = builder.BuildFromLocalOnly(localData, repoURL)
-	}
+	insights := builder.BuildInsights(githubData)
 
 	// Apply CLI overrides
-	applySecurityPracticeOverrides(cmd, &insights)
 	applyAssessmentOverrides(cmd, &insights)
-	applyChampionOverrides(cmd, &insights)
-	applyToolResultsOverrides(cmd, &insights)
-
-	// Apply comment if provided
-	if comment != "" {
-		insights.Header.Comment = comment
-	}
-
-	// Interactive mode
-	if interactive {
-		if err := runInteractiveMode(&insights); err != nil {
-			return err
-		}
-	}
 
 	// Write output
 	writer := generator.NewWriter(verbose)
 	opts := generator.WriteOptions{
-		DryRun:    dryRun,
-		Force:     force,
-		ShowEmpty: showEmpty,
+		DryRun: dryRun,
+		Force:  force,
 	}
 
 	// Convert to absolute path
@@ -265,53 +214,38 @@ func runGenerate(cmd *cobra.Command, args []string) error {
 		fmt.Printf("✅ Generated %s\n", absOutputPath)
 	}
 
+	// Validate the generated output against CUE schema
+	yamlBytes, err := writer.ToYAML(insights)
+	if err == nil {
+		v := validator.NewCUEValidator(schemaPath, false)
+		if result, err := v.Validate(yamlBytes); err == nil && !result.Valid {
+			fmt.Fprintf(os.Stderr, "\n⚠️  Schema validation warnings:\n")
+			for _, e := range result.Errors {
+				fmt.Fprintf(os.Stderr, "  - %s\n", e)
+			}
+		}
+	}
+
 	return nil
 }
 
-func runInteractiveMode(insights *model.SecurityInsights) error {
-	// TODO: Implement interactive prompts for full spec format
-	fmt.Println("⚠️  Interactive mode not yet implemented for full spec format")
-	return nil
-}
-
-func applySecurityPracticeOverrides(cmd *cobra.Command, insights *model.SecurityInsights) {
-	// Check if any override flags were set
-	mfaSet := cmd.Flags().Changed("mfa-enforced")
-	branchSet := cmd.Flags().Changed("branch-protection")
-	codeReviewSet := cmd.Flags().Changed("code-review")
-
-	if !mfaSet && !branchSet && !codeReviewSet {
-		return
+// parseAssessmentFlag parses "URL" or "URL,YYYY-MM-DD" into url and date.
+func parseAssessmentFlag(value string) (url, date string) {
+	if i := strings.LastIndex(value, ","); i > 0 {
+		candidate := value[i+1:]
+		// Check if it looks like a date (YYYY-MM-DD)
+		if len(candidate) == 10 && candidate[4] == '-' && candidate[7] == '-' {
+			return value[:i], candidate
+		}
 	}
-
-	// Ensure repository and security sections exist
-	if insights.Repository == nil {
-		insights.Repository = &model.Repository{}
-	}
-	if insights.Repository.Security == nil {
-		insights.Repository.Security = &model.Security{}
-	}
-	if insights.Repository.Security.Practices == nil {
-		insights.Repository.Security.Practices = &model.SecurityPractices{}
-	}
-
-	// Apply overrides
-	if mfaSet {
-		insights.Repository.Security.Practices.MFAEnforced = *mfaEnforced
-	}
-	if branchSet {
-		insights.Repository.Security.Practices.BranchProtection = *branchProtection
-	}
-	if codeReviewSet {
-		insights.Repository.Security.Practices.CodeReviewRequired = *codeReview
-	}
+	return value, ""
 }
 
 func applyAssessmentOverrides(cmd *cobra.Command, insights *model.SecurityInsights) {
-	selfURLSet := cmd.Flags().Changed("self-assessment")
-	thirdPartyURLSet := cmd.Flags().Changed("third-party-audit")
+	selfSet := cmd.Flags().Changed("self-assessment")
+	thirdPartySet := cmd.Flags().Changed("third-party-audit")
 
-	if !selfURLSet && !thirdPartyURLSet {
+	if !selfSet && !thirdPartySet {
 		return
 	}
 
@@ -326,91 +260,25 @@ func applyAssessmentOverrides(cmd *cobra.Command, insights *model.SecurityInsigh
 		insights.Repository.Security.Assessments = &model.Assessments{}
 	}
 
-	// Apply self-assessment override
-	if selfURLSet && selfAssessmentURL != "" {
+	if selfSet && selfAssessment != "" {
+		url, date := parseAssessmentFlag(selfAssessment)
 		insights.Repository.Security.Assessments.Self = &model.Assessment{
-			Evidence: selfAssessmentURL,
-			Date:     selfAssessmentDate,
+			Evidence: url,
+			Date:     date,
 			Comment:  "Self-assessment",
 		}
 	}
 
-	// Apply third-party audit override
-	if thirdPartyURLSet && thirdPartyAuditURL != "" {
+	if thirdPartySet && thirdPartyAudit != "" {
+		url, date := parseAssessmentFlag(thirdPartyAudit)
 		insights.Repository.Security.Assessments.ThirdParty = append(
 			insights.Repository.Security.Assessments.ThirdParty,
 			model.Assessment{
-				Evidence: thirdPartyAuditURL,
-				Date:     thirdPartyAuditDate,
+				Evidence: url,
+				Date:     date,
 				Comment:  "Third-party security audit",
 			},
 		)
-	}
-}
-
-func applyChampionOverrides(cmd *cobra.Command, insights *model.SecurityInsights) {
-	championSet := cmd.Flags().Changed("champion")
-
-	if !championSet || championName == "" {
-		return
-	}
-
-	// Ensure repository and security sections exist
-	if insights.Repository == nil {
-		insights.Repository = &model.Repository{}
-	}
-	if insights.Repository.Security == nil {
-		insights.Repository.Security = &model.Security{}
-	}
-
-	// Add champion
-	champion := model.Person{
-		Name:    championName,
-		Email:   championEmail,
-		Primary: true,
-	}
-	insights.Repository.Security.Champions = append(insights.Repository.Security.Champions, champion)
-}
-
-func applyToolResultsOverrides(cmd *cobra.Command, insights *model.SecurityInsights) {
-	if !cmd.Flags().Changed("tool-results-url") || toolResultsURL == "" {
-		return
-	}
-
-	// Ensure repository and security sections exist
-	if insights.Repository == nil || insights.Repository.Security == nil {
-		return
-	}
-
-	// Add results to all tools
-	for i := range insights.Repository.Security.Tools {
-		tool := &insights.Repository.Security.Tools[i]
-		tool.Results = &model.ToolResults{}
-
-		if tool.Integration != nil && tool.Integration.AdHoc {
-			tool.Results.AdHoc = &model.Attestation{
-				Name:         fmt.Sprintf("Scheduled %s Scan Results", tool.Type),
-				PredicateURI: fmt.Sprintf("https://intoto.%s", tool.Type),
-				Location:     toolResultsURL + "#" + tool.Type,
-				Comment:      "Replace {version} with the actual version number for the release you want results for.",
-			}
-		}
-		if tool.Integration != nil && tool.Integration.CI {
-			tool.Results.CI = &model.Attestation{
-				Name:         fmt.Sprintf("PR %s Scan Results", tool.Type),
-				PredicateURI: fmt.Sprintf("https://intoto.%s", tool.Type),
-				Location:     toolResultsURL + "#" + tool.Type,
-				Comment:      "Replace {version} with the actual version number for the release you want results for.",
-			}
-		}
-		if tool.Integration != nil && tool.Integration.Release {
-			tool.Results.Release = &model.Attestation{
-				Name:         fmt.Sprintf("Release %s Scan Results", tool.Type),
-				PredicateURI: fmt.Sprintf("https://intoto.%s", tool.Type),
-				Location:     toolResultsURL + "#" + tool.Type,
-				Comment:      "Replace {version} with the actual version number for the release you want results for.",
-			}
-		}
 	}
 }
 
@@ -441,4 +309,23 @@ func runValidate(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+func runWizard(cmd *cobra.Command, args []string) error {
+	// Resolve GitHub token
+	githubToken := token
+	if githubToken == "" {
+		githubToken = os.Getenv("GITHUB_TOKEN")
+	}
+	if githubToken == "" {
+		return fmt.Errorf("a GitHub token is required: use --token flag or set GITHUB_TOKEN environment variable")
+	}
+
+	absOutputPath, err := filepath.Abs(outputPath)
+	if err != nil {
+		absOutputPath = outputPath
+	}
+
+	srv := wizard.NewServer(githubToken, repoURL, absOutputPath, verbose, wizardPort)
+	return srv.Start()
 }
